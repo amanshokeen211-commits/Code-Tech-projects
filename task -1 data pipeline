@@ -1,0 +1,342 @@
+# data loading
+import pandas as pd
+import numpy as np
+from typing import Tuple, Dict
+import yaml
+
+class DataLoader:
+    def __init__(self, config_path: str = 'config.yaml'):
+        with open(config_path, 'r') as file:
+            self.config = yaml.safe_load(file)
+    
+    def generate_sample_data(self, n_samples: int = 10000) -> pd.DataFrame:
+        """Generate sample customer data for demonstration"""
+        np.random.seed(42)
+        
+        data = {
+            'customer_id': range(1, n_samples + 1),
+            'age': np.random.randint(18, 80, n_samples),
+            'balance': np.random.normal(50000, 20000, n_samples),
+            'credit_score': np.random.normal(650, 100, n_samples),
+            'estimated_salary': np.random.normal(60000, 25000, n_samples),
+            'geography': np.random.choice(['Germany', 'France', 'Spain'], n_samples),
+            'gender': np.random.choice(['Male', 'Female'], n_samples),
+            'has_credit_card': np.random.choice([0, 1], n_samples),
+            'is_active_member': np.random.choice([0, 1], n_samples),
+            'tenure': np.random.randint(1, 10, n_samples)
+        }
+        
+        # Create target variable with some logic
+        data['churn'] = (
+            (data['balance'] < 30000) | 
+            (data['credit_score'] < 600) |
+            (np.array(data['is_active_member']) == 0)
+        ).astype(int)
+        
+        df = pd.DataFrame(data)
+        df.to_csv(self.config['data']['raw_path'], index=False)
+        return df
+    
+    def load_data(self) -> pd.DataFrame:
+        """Load data from CSV file"""
+        try:
+            df = pd.read_csv(self.config['data']['raw_path'])
+            print(f"Data loaded successfully. Shape: {df.shape}")
+            return df
+        except FileNotFoundError:
+            print("Raw data not found. Generating sample data...")
+# data preprocessing
+import pandas as pd
+import numpy as np
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+import yaml
+
+class DataPreprocessor(BaseEstimator, TransformerMixin):
+    def __init__(self, config_path: str = 'config.yaml'):
+        with open(config_path, 'r') as file:
+            self.config = yaml.safe_load(file)
+        
+        self.numeric_features = self.config['preprocessing']['numeric_features']
+        self.categorical_features = self.config['preprocessing']['categorical_features']
+        self.target = self.config['preprocessing']['target']
+        
+        # Create preprocessing pipelines
+        self.numeric_transformer = Pipeline(steps=[
+            ('imputer', SimpleImputer(strategy='median')),
+            ('scaler', StandardScaler())
+        ])
+        
+        self.categorical_transformer = Pipeline(steps=[
+            ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
+            ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))
+        ])
+        
+        self.preprocessor = ColumnTransformer(
+            transformers=[
+                ('num', self.numeric_transformer, self.numeric_features),
+                ('cat', self.categorical_transformer, self.categorical_features)
+            ]
+        )
+    
+    def fit(self, X: pd.DataFrame, y=None):
+        """Fit the preprocessor"""
+        X_features = X[self.numeric_features + self.categorical_features]
+        self.preprocessor.fit(X_features)
+        return self
+    
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        """Transform the data"""
+        X_features = X[self.numeric_features + self.categorical_features]
+        
+        # Transform features
+        transformed_array = self.preprocessor.transform(X_features)
+        
+        # Get feature names after transformation
+        numeric_features_transformed = self.numeric_features
+        categorical_features_transformed = self.preprocessor.named_transformers_['cat'].named_steps['onehot'].get_feature_names_out(self.categorical_features)
+        
+        all_feature_names = list(numeric_features_transformed) + list(categorical_features_transformed)
+        
+        # Create transformed DataFrame
+        X_transformed = pd.DataFrame(
+            transformed_array,
+            columns=all_feature_names,
+            index=X.index
+        )
+        
+        # Add non-feature columns back
+        non_feature_columns = [col for col in X.columns if col not in self.numeric_features + self.categorical_features]
+        for col in non_feature_columns:
+            X_transformed[col] = X[col].values
+        
+        return X_transformed
+    
+    def handle_missing_values(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Handle missing values in the dataset"""
+        df_clean = df.copy()
+        
+        # Fill numeric missing values with median
+        for col in self.numeric_features:
+            if col in df_clean.columns:
+                df_clean[col].fillna(df_clean[col].median(), inplace=True)
+        
+        # Fill categorical missing values with mode
+        for col in self.categorical_features:
+            if col in df_clean.columns:
+                df_clean[col].fillna(df_clean[col].mode()[0] if not df_clean[col].mode().empty else 'missing', inplace=True)
+        
+        return df_clean
+    
+    def remove_outliers(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Remove outliers using IQR method"""
+        df_clean = df.copy()
+        
+        for col in self.numeric_features:
+            if col in df_clean.columns:
+                Q1 = df_clean[col].quantile(0.25)
+                Q3 = df_clean[col].quantile(0.75)
+                IQR = Q3 - Q1
+                lower_bound = Q1 - 1.5 * IQR
+                upper_bound = Q3 + 1.5 * IQR
+                
+                # Cap outliers instead of removing
+                df_clean[col] = np.where(df_clean[col] < lower_bound, lower_bound, df_clean[col])
+                df_clean[col] = np.where(df_clean[col] > upper_bound, upper_bound, df_clean[col])
+        
+        return df_clean
+# data transformation
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.decomposition import PCA
+import yaml
+
+class DataTransformer:
+    def __init__(self, config_path: str = 'config.yaml'):
+        with open(config_path, 'r') as file:
+            self.config = yaml.safe_load(file)
+        
+        self.target = self.config['preprocessing']['target']
+        self.test_size = self.config['transformation']['test_size']
+        self.random_state = self.config['transformation']['random_state']
+    
+    def create_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Create new features from existing data"""
+        df_eng = df.copy()
+        
+        # Create age groups
+        df_eng['age_group'] = pd.cut(df_eng['age'], 
+                                   bins=[0, 30, 45, 60, 100], 
+                                   labels=['Young', 'Adult', 'Middle', 'Senior'])
+        
+        # Create balance to salary ratio
+        df_eng['balance_salary_ratio'] = df_eng['balance'] / (df_eng['estimated_salary'] + 1)
+        
+        # Create credit score categories
+        df_eng['credit_score_category'] = pd.cut(df_eng['credit_score'],
+                                               bins=[0, 580, 670, 740, 800, 850],
+                                               labels=['Poor', 'Fair', 'Good', 'Very Good', 'Excellent'])
+        
+        return df_eng
+    
+    def split_data(self, df: pd.DataFrame) -> tuple:
+        """Split data into train and test sets"""
+        feature_columns = [col for col in df.columns if col != self.target]
+        
+        X = df[feature_columns]
+        y = df[self.target]
+        
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, 
+            test_size=self.test_size, 
+            random_state=self.random_state,
+            stratify=y
+        )
+        
+        print(f"Training set: {X_train.shape}, Test set: {X_test.shape}")
+        return X_train, X_test, y_train, y_test
+    
+    def select_features(self, X: pd.DataFrame, y: pd.Series, k: int = 10) -> tuple:
+        """Select top k features using ANOVA F-test"""
+        selector = SelectKBest(score_func=f_classif, k=min(k, X.shape[1]))
+        X_selected = selector.fit_transform(X, y)
+        selected_features = X.columns[selector.get_support()].tolist()
+        
+        print(f"Selected {len(selected_features)} features: {selected_features}")
+        return X_selected, selected_features, selector
+    
+    def apply_pca(self, X: pd.DataFrame, n_components: float = 0.95) -> tuple:
+        """Apply PCA for dimensionality reduction"""
+        pca = PCA(n_components=n_components, random_state=self.random_state)
+        X_pca = pca.fit_transform(X)
+        
+        print(f"Original features: {X.shape[1]}")
+        print(f"PCA components: {X_pca.shape[1]}")
+        print(f"Explained variance ratio: {pca.explained_variance_ratio_.sum():.3f}")
+        
+        return X_pca, pca
+#Main pipiline
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
+import joblib
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+import yaml
+
+from src.data_loader import DataLoader
+from src.preprocessor import DataPreprocessor
+from src.transformer import DataTransformer
+
+class MLPipeline:
+    def __init__(self, config_path: str = 'config.yaml'):
+        with open(config_path, 'r') as file:
+            self.config = yaml.safe_load(file)
+        
+        self.loader = DataLoader(config_path)
+        self.preprocessor = DataPreprocessor(config_path)
+        self.transformer = DataTransformer(config_path)
+        self.model = None
+    
+    def run_pipeline(self) -> dict:
+        """Run the complete ML pipeline"""
+        print("Starting ML Pipeline...")
+        
+        # Step 1: Load Data
+        print("\n1. Loading Data...")
+        df = self.loader.load_data()
+        print(f"Original data shape: {df.shape}")
+        
+        # Step 2: Preprocess Data
+        print("\n2. Preprocessing Data...")
+        df_clean = self.preprocessor.handle_missing_values(df)
+        df_clean = self.preprocessor.remove_outliers(df_clean)
+        
+        # Step 3: Feature Engineering
+        print("\n3. Feature Engineering...")
+        df_features = self.transformer.create_features(df_clean)
+        
+        # Step 4: Transform Data
+        print("\n4. Transforming Data...")
+        df_transformed = self.preprocessor.transform(df_features)
+        
+        # Step 5: Split Data
+        print("\n5. Splitting Data...")
+        X_train, X_test, y_train, y_test = self.transformer.split_data(df_transformed)
+        
+        # Step 6: Train Model
+        print("\n6. Training Model...")
+        model_config = self.config['model']
+        if model_config['algorithm'] == 'random_forest':
+            self.model = RandomForestClassifier(**model_config['params'])
+        elif model_config['algorithm'] == 'logistic_regression':
+            self.model = LogisticRegression()
+        else:
+            self.model = RandomForestClassifier()
+        
+        self.model.fit(X_train, y_train)
+        
+        # Step 7: Evaluate Model
+        print("\n7. Evaluating Model...")
+        results = self.evaluate_model(X_test, y_test)
+        
+        # Step 8: Save Artifacts
+        print("\n8. Saving Artifacts...")
+        self.save_artifacts(df_transformed, X_test, y_test)
+        
+        return results
+    
+    def evaluate_model(self, X_test: pd.DataFrame, y_test: pd.Series) -> dict:
+        """Evaluate the trained model"""
+        y_pred = self.model.predict(X_test)
+        y_pred_proba = self.model.predict_proba(X_test)[:, 1]
+        
+        # Calculate metrics
+        accuracy = self.model.score(X_test, y_test)
+        auc_score = roc_auc_score(y_test, y_pred_proba)
+        
+        print(f"Accuracy: {accuracy:.4f}")
+        print(f"AUC Score: {auc_score:.4f}")
+        print("\nClassification Report:")
+        print(classification_report(y_test, y_pred))
+        
+        # Plot confusion matrix
+        self.plot_confusion_matrix(y_test, y_pred)
+        
+        return {
+            'accuracy': accuracy,
+            'auc_score': auc_score,
+            'classification_report': classification_report(y_test, y_pred, output_dict=True)
+        }
+    
+    def plot_confusion_matrix(self, y_true: pd.Series, y_pred: pd.Series):
+        """Plot confusion matrix"""
+        cm = confusion_matrix(y_true, y_pred)
+        plt.figure(figsize=(8, 6))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+        plt.title('Confusion Matrix')
+        plt.ylabel('Actual')
+        plt.xlabel('Predicted')
+        plt.savefig('data/processed/confusion_matrix.png')
+        plt.close()
+    
+    def save_artifacts(self, df: pd.DataFrame, X_test: pd.DataFrame, y_test: pd.Series):
+        """Save processed data and trained model"""
+        # Create directories if they don't exist
+        os.makedirs('data/processed', exist_ok=True)
+        os.makedirs('models', exist_ok=True)
+        
+        # Save processed data
+        df.to_csv('data/processed/processed_data.csv', index=False)
+        
+        # Save test data
+        test_data = X_test.copy
+            return self.generate_sample_data()
